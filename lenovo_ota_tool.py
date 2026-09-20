@@ -14,6 +14,8 @@ import sys
 import json
 import time
 import shutil
+import struct
+import hashlib
 import zipfile
 import tempfile
 import threading
@@ -22,6 +24,8 @@ import urllib.parse
 import urllib.request
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
+
+APP_VERSION = "2.1.1"
 
 API_URL = "https://ota.lenovo.com/ota-server/firmware/query/for-text-desc"
 
@@ -173,6 +177,148 @@ def pdg_extract(payload_path, out_dir, partitions=None, old_dir=None, log=None):
     return r.returncode, out
 
 
+# ---------------- payload manifest 解析 & 源镜像校验 ----------------
+def sha256_file(path, chunk=1024 * 1024):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def _rd_varint(buf, pos):
+    r = 0
+    sh = 0
+    while True:
+        b = buf[pos]
+        pos += 1
+        r |= (b & 0x7F) << sh
+        if not (b & 0x80):
+            return r, pos
+        sh += 7
+
+
+def _pb_fields(buf, start, end):
+    """极简 protobuf 字段遍历 → [(字段号, wire_type, 值)]"""
+    i = start
+    out = []
+    while i < end:
+        key, i = _rd_varint(buf, i)
+        fno, wt = key >> 3, key & 7
+        if wt == 0:
+            v, i = _rd_varint(buf, i)
+        elif wt == 2:
+            ln, i = _rd_varint(buf, i)
+            v = (i, i + ln)
+            i += ln
+        elif wt == 5:
+            v = buf[i:i + 4]
+            i += 4
+        elif wt == 1:
+            v = buf[i:i + 8]
+            i += 8
+        else:
+            raise ValueError(f"不支持的 protobuf wire type {wt}")
+        out.append((fno, wt, v))
+    return out
+
+
+def payload_part_hashes(payload_path, names=None):
+    """读 payload.bin 的 manifest → {分区名: (old_sha256, new_sha256)}
+
+    增量包里 old_sha256 就是该分区在 pre-build 版本中的哈希，
+    可用来判断手头/从设备 dd 出来的源镜像是否真是这一跳需要的版本。
+    """
+    with open(payload_path, "rb") as f:
+        head = f.read(24)
+        if head[:4] != b"CrAU":
+            raise RuntimeError("payload.bin 头部无效（不是 ChromeOS/Android OTA payload）")
+        msize = struct.unpack(">Q", head[12:20])[0]
+        man = f.read(msize)
+    want = set(names) if names else None
+    res = {}
+    for fno, wt, v in _pb_fields(man, 0, len(man)):
+        if fno != 13 or wt != 2:
+            continue
+        name = old = new = None
+        for g, w2, v2 in _pb_fields(man, v[0], v[1]):
+            if g == 1 and w2 == 2:
+                name = man[v2[0]:v2[1]].decode("utf-8", "replace")
+            elif g in (6, 7) and w2 == 2:
+                for h3, w3, v3 in _pb_fields(man, v2[0], v2[1]):
+                    if h3 == 2 and w3 == 2:
+                        if g == 6:
+                            old = man[v3[0]:v3[1]].hex()
+                        else:
+                            new = man[v3[0]:v3[1]].hex()
+        if name and (want is None or name in want):
+            res[name] = (old, new)
+    return res
+
+
+class ImgIndex:
+    """镜像 sha256 缓存（按 文件大小+修改时间 复用），索引存 cache/_img_index.json"""
+
+    def __init__(self, cache_dir):
+        self.path = os.path.join(cache_dir, "_img_index.json")
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                self.db = json.load(f)
+        except Exception:
+            self.db = {}
+
+    def sha256(self, img):
+        try:
+            st = os.stat(img)
+        except OSError:
+            return None
+        key = os.path.abspath(img)
+        rec = self.db.get(key)
+        if rec and rec.get("size") == st.st_size and rec.get("mtime") == int(st.st_mtime):
+            return rec.get("sha256")
+        h = sha256_file(img)
+        self.db[key] = {"size": st.st_size, "mtime": int(st.st_mtime), "sha256": h}
+        self.save()
+        return h
+
+    def save(self):
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self.db, f)
+        except Exception:
+            pass
+
+
+def source_search_dirs(cache, base, out):
+    """可以拿来当源镜像的目录：输出目录、基础目录、缓存下的所有子目录（_hopN 等）"""
+    dirs = [out, base]
+    try:
+        for d in sorted(os.listdir(cache)):
+            fp = os.path.join(cache, d)
+            if os.path.isdir(fp):
+                dirs.append(fp)
+    except OSError:
+        pass
+    seen, uniq = set(), []
+    for d in dirs:
+        if d and os.path.isdir(d) and os.path.abspath(d) not in seen:
+            seen.add(os.path.abspath(d))
+            uniq.append(d)
+    return uniq
+
+
+def find_source_image(name, want_hash, dirs, index):
+    """在候选目录里找 sha256 与官方 old 哈希一致的 <name>.img"""
+    for d in dirs:
+        fp = os.path.join(d, name + ".img")
+        if os.path.isfile(fp) and index.sha256(fp) == want_hash:
+            return fp
+    return None
+
+
 # ---------------- adb / 设备读取 ----------------
 def adb_run(args, timeout=180):
     r = subprocess.run(["adb"] + args, capture_output=True, timeout=timeout)
@@ -235,7 +381,7 @@ def missing_base_parts(parts, base_dir):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("联想 OTA 查询 & 分区提取工具  v1.0")
+        self.title(f"联想 OTA 查询 & 分区提取工具  v{APP_VERSION}")
         self.geometry("1000x720")
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True)
@@ -468,10 +614,12 @@ class App(tk.Tk):
         self.alog_write("自动模式说明：\n"
                         "1) 填「起始版本」（链的源版本，一般填设备当前版本）和「基础源镜像目录」\n"
                         "   （该目录里要有起始版本的 <分区名>.img；没有可用下面的按钮从设备 dd）\n"
+                        "   ※ 设备若已 root / 换过内核，dd 出来的 init_boot、boot、vbmeta 等已非官方镜像，\n"
+                        "     增量包会校验失败；工具会在缓存里自动找同哈希的官方镜像替代，实在没有才停止。\n"
                         "2) 选好要提取的分区 → 点「自动走链并提取」\n"
-                        "3) 工具会自动：查链路 → 下载每一跳增量包（缓存复用）→ 逐跳应用 → 输出目标版本分区\n"
+                        "3) 工具会自动：查链路 → 下载每一跳增量包（缓存复用）→ 校验源镜像 → 逐跳应用 → 输出\n"
                         "4) 目标版本留空则一路走到服务器没有下一版为止\n"
-                        "5) 结果在「输出目录」里，每个分区一个 <分区名>.img，并自动做哈希校验")
+                        "5) 结果在「输出目录」里，每个分区一个 <分区名>.img，并自动对照官方 manifest 做哈希校验")
 
     def _on_adev(self, *_):
         d = DEVICES[self.a_combo.current()]
@@ -543,6 +691,8 @@ class App(tk.Tk):
                 self.alog_write("    [失败] 未勾选自动读取且手动目录缺少这些分区，停止（未开始下载）")
                 return
         self.alog_write(f"    源镜像就绪（{len(parts)} 个分区）")
+        self.alog_write("    提示：每跳会先用增量包 manifest 里的官方哈希校验源镜像；"
+                        "对不上时会在缓存/输出目录里自动找同哈希镜像，找不到才停止")
 
         # 1) 走链
         self.alog_write(f"[1] 查询链路，起点: {start}")
@@ -570,7 +720,11 @@ class App(tk.Tk):
 
         # 2) 逐跳下载并应用
         cur = base
+        index = ImgIndex(cache)
+        search_dirs = source_search_dirs(cache, base, out)
+        last_new = {}
         for i, h in enumerate(hops, 1):
+            pre_ver = start if i == 1 else hops[i - 2]["to_version"]
             pkg = os.path.join(cache, os.path.basename(h["url"]))
             if os.path.isfile(pkg) and os.path.getsize(pkg) == h["size"]:
                 self.alog_write(f"[{i+1}] 复用缓存 {os.path.basename(pkg)}")
@@ -593,7 +747,60 @@ class App(tk.Tk):
                 payload = extract_payload_from_zip(pkg, work, self.alog_write)
                 plist, is_delta, _ = pdg_list(payload)
                 hop_out = os.path.join(cache, f"_hop{i}")
-                rc, log = pdg_extract(payload, hop_out, parts, cur if is_delta else None, self.alog_write)
+                src_dir = cur
+                want = {}
+                if is_delta:
+                    # 2.1) 先用 manifest 里的 old 哈希校验源镜像，避免 pdg 跑到一半才报错
+                    try:
+                        want = payload_part_hashes(payload, parts)
+                    except Exception as e:
+                        self.alog_write(f"      [提示] 无法解析 manifest 校验源镜像: {e}")
+                    bad, fixed = [], {}
+                    for p in parts:
+                        exp = (want.get(p) or (None, None))[0]
+                        fp = os.path.join(cur, p + ".img")
+                        if not exp or not os.path.isfile(fp):
+                            continue
+                        act = index.sha256(fp)
+                        if act == exp:
+                            continue
+                        self.alog_write(f"      ⚠ 源镜像 {p}.img 与官方 {pre_ver} 不一致：")
+                        self.alog_write(f"          官方 sha256 {exp}")
+                        self.alog_write(f"          实际 sha256 {act}")
+                        found = find_source_image(p, exp, search_dirs, index)
+                        if found:
+                            fixed[p] = found
+                            self.alog_write(f"        → 已自动改用 {found}")
+                        else:
+                            bad.append((p, exp))
+                    if bad:
+                        self.alog_write("      [失败] 找不到与官方哈希一致的源镜像，停止。")
+                        for p, exp in bad:
+                            self.alog_write(f"        缺少 {p}.img（需要 sha256 = {exp}）")
+                        self.alog_write("        原因 / 处理：")
+                        self.alog_write("        ① 设备 dd 出来的分区若被 root / 自定义内核 / 补丁改过"
+                                        "（init_boot、boot、vbmeta 最常见），")
+                        self.alog_write("           就和官方镜像不一致，不能当增量包的源；"
+                                        "该分区需先恢复官方镜像（9008 刷回官方包）")
+                        self.alog_write("        ② 或把「基础源镜像目录」/ 起始版本换成你手上有官方镜像的那个版本")
+                        self.alog_write("        ③ 之前成功跑过链的话，缓存目录里的 _hopN 子目录就是各版本的官方镜像，"
+                                        "工具会自动复用")
+                        return
+                    if fixed:
+                        src_dir = os.path.join(cache, f"_src{i}")
+                        os.makedirs(src_dir, exist_ok=True)
+                        for p in parts:
+                            dst = os.path.join(src_dir, p + ".img")
+                            s = fixed.get(p) or os.path.join(cur, p + ".img")
+                            if not os.path.isfile(s) or os.path.exists(dst):
+                                continue
+                            try:
+                                os.link(s, dst)      # 同盘硬链接，零拷贝
+                            except OSError:
+                                shutil.copy2(s, dst)
+                        self.alog_write(f"      本跳源镜像目录: {src_dir}")
+                rc, log = pdg_extract(payload, hop_out, parts, src_dir if is_delta else None, self.alog_write)
+                last_new = {p: v[1] for p, v in want.items() if v and v[1]}
                 ok = [p for p in parts if os.path.isfile(os.path.join(hop_out, p + ".img"))]
                 self.alog_write(f"      应用完成（{'增量包' if is_delta else '全量包'}），产出: {', '.join(ok) if ok else '无'}")
                 if not ok:
@@ -604,6 +811,9 @@ class App(tk.Tk):
                         self.alog_write("      pdg 报错:")
                         for l in err_lines[-6:]:
                             self.alog_write("        " + l.strip())
+                    if "source data verification failed" in log:
+                        self.alog_write("      → 该报错=源镜像不是官方 pre-build 版本（多因设备被 root/改过，"
+                                        "dd 出来的镜像非官方）")
                     self.alog_write("      [失败] 本跳没有产出，已停止。排查顺序：")
                     self.alog_write("        ① 源镜像是否为本跳 pre-build 版本的该分区（版本不匹配会失败）")
                     self.alog_write("        ② 源镜像文件是否完整（大小应与分区一致）")
@@ -613,14 +823,34 @@ class App(tk.Tk):
             except Exception as e:
                 self.alog_write(f"      [异常] {e}"); return
 
-        # 3) 输出
+        # 3) 输出 + 哈希校验（对照最后一跳 manifest 的 new 哈希）
         final = os.path.join(cache, f"_hop{len(hops)}")
+        bad_out = []
         for p in parts:
             src_f = os.path.join(final, p + ".img")
-            if os.path.isfile(src_f):
-                shutil.copy2(src_f, os.path.join(out, p + ".img"))
-                self.alog_write(f"  ✓ {p}.img  {human_size(os.path.getsize(src_f))}")
-        self.alog_write(f"\n[完成] 目标版本：{hops[-1]['to_version']}\n        输出目录：{out}")
+            if not os.path.isfile(src_f):
+                continue
+            dst_f = os.path.join(out, p + ".img")
+            shutil.copy2(src_f, dst_f)
+            act = index.sha256(dst_f)
+            exp = last_new.get(p)
+            if exp:
+                good = (act == exp)
+                if not good:
+                    bad_out.append(p)
+                self.alog_write(f"  {'✓' if good else '✗'} {p}.img  {human_size(os.path.getsize(dst_f))}"
+                                f"  {'哈希校验通过' if good else '哈希校验失败'}"
+                                f"  sha256={act}")
+                if not good:
+                    self.alog_write(f"      官方应为 {exp}")
+            else:
+                self.alog_write(f"  ✓ {p}.img  {human_size(os.path.getsize(dst_f))}  sha256={act}")
+        if bad_out:
+            self.alog_write(f"\n[完成-有异常] 目标版本：{hops[-1]['to_version']}\n"
+                            f"        以下分区与官方哈希不符: {', '.join(bad_out)}\n"
+                            f"        输出目录：{out}")
+        else:
+            self.alog_write(f"\n[完成] 目标版本：{hops[-1]['to_version']}\n        输出目录：{out}")
 
     # ----- 从设备读取基础镜像 -----
     def adb_base_run(self):

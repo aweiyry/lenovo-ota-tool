@@ -173,6 +173,64 @@ def pdg_extract(payload_path, out_dir, partitions=None, old_dir=None, log=None):
     return r.returncode, out
 
 
+# ---------------- adb / 设备读取 ----------------
+def adb_run(args, timeout=180):
+    r = subprocess.run(["adb"] + args, capture_output=True, timeout=timeout)
+    return (r.stdout or b"").decode("utf-8", "replace")
+
+
+def adb_device_state():
+    """返回 (是否已连接, 设备当前版本串, 槽位)"""
+    try:
+        out = adb_run(["devices"], timeout=15)
+        if "\tdevice" not in out:
+            return False, None, None
+        ver = adb_run(["shell", "getprop ro.build.version.incremental"], timeout=20).strip()
+        slot = adb_run(["shell", "getprop ro.boot.slot_suffix"], timeout=20).strip() or "_a"
+        return True, ver, slot
+    except Exception:
+        return False, None, None
+
+
+def adb_read_partitions(parts, out_dir, log):
+    """从设备 dd 出指定分区镜像，返回成功列表"""
+    os.makedirs(out_dir, exist_ok=True)
+    try:
+        if not adb_run(["shell", "su -c id"], timeout=25).startswith("uid=0"):
+            log("  [adb] 设备未 root（su 不可用），无法直接读取分区")
+            return []
+    except Exception as e:
+        log(f"  [adb] 执行失败: {e}")
+        return []
+    slot = adb_run(["shell", "getprop ro.boot.slot_suffix"], timeout=20).strip() or "_a"
+    log(f"  [adb] 当前槽位: {slot}")
+    ok = []
+    for p in parts:
+        dev = f"/dev/block/bootdevice/by-name/{p}{slot}"
+        try:
+            adb_run(["shell", f"su -c 'dd if={dev} of=/data/local/tmp/{p}.img 2>/dev/null'"])
+            r = subprocess.run(["adb", "pull", f"/data/local/tmp/{p}.img",
+                                os.path.join(out_dir, p + ".img")],
+                               capture_output=True, timeout=900)
+            fp = os.path.join(out_dir, p + ".img")
+            if r.returncode == 0 and os.path.isfile(fp) and os.path.getsize(fp) > 0:
+                log(f"  ✓ {p}.img  {human_size(os.path.getsize(fp))}")
+                ok.append(p)
+            else:
+                log(f"  ✗ {p} 读取失败（分区名或权限问题）")
+        except Exception as e:
+            log(f"  ✗ {p}: {e}")
+    adb_run(["shell", "su -c 'rm -f /data/local/tmp/*.img'"])
+    return ok
+
+
+def missing_base_parts(parts, base_dir):
+    """返回基础源镜像目录里缺失的分区列表"""
+    if not base_dir or not os.path.isdir(base_dir):
+        return list(parts)
+    return [p for p in parts if not os.path.isfile(os.path.join(base_dir, p + ".img"))]
+
+
 # ------------------------- GUI -------------------------
 class App(tk.Tk):
     def __init__(self):
@@ -362,8 +420,12 @@ class App(tk.Tk):
         ttk.Entry(top, textvariable=self.a_base, width=62).grid(row=3, column=1, columnspan=2, sticky="we", padx=6)
         ttk.Button(top, text="浏览…", command=lambda: self.a_base.set(
             filedialog.askdirectory() or self.a_base.get())).grid(row=3, column=3, sticky="w", padx=6)
-        ttk.Label(top, text="↑ 起始版本这些分区的镜像（可选：点下面按钮直接从设备读取，需 root）",
+        ttk.Label(top, text="↑ 起始版本这些分区的镜像（可勾选下面自动从设备读取，需 root）",
                   foreground="#666").grid(row=4, column=1, sticky="w", padx=6)
+
+        self.a_autodev = tk.BooleanVar(value=True)
+        ttk.Checkbutton(top, text="自动从设备读取基础镜像（需 adb + root；读取后用设备当前版本作为起始版本）",
+                        variable=self.a_autodev).grid(row=4, column=1, sticky="e", padx=6)
 
         ttk.Label(top, text="缓存目录（下载的包存这里，可复用）：").grid(row=5, column=0, sticky="w", padx=6, pady=5)
         self.a_cache = tk.StringVar(value=os.path.join(BASE_DIR, "cache"))
@@ -435,20 +497,55 @@ class App(tk.Tk):
         cache = self.a_cache.get().strip() or os.path.join(BASE_DIR, "cache")
         out = self.a_out.get().strip() or os.path.join(BASE_DIR, "auto_out")
         parts = [self.a_parts.get(i) for i in self.a_parts.curselection()]
-        if not start:
-            messagebox.showwarning("提示", "请填起始版本"); return
+        if not start and not self.a_autodev.get():
+            messagebox.showwarning("提示", "请填起始版本（或勾选自动从设备读取）"); return
         if not parts:
             messagebox.showwarning("提示", "请选择要提取的分区"); return
         if base and not os.path.isdir(base):
             messagebox.showwarning("提示", "基础源镜像目录不存在"); return
         threading.Thread(target=self._auto_worker,
-                         args=(model, sn, start, target, base, parts, cache, out), daemon=True).start()
+                         args=(model, sn, start, target, base, parts, cache, out,
+                               self.a_autodev.get()), daemon=True).start()
 
-    def _auto_worker(self, model, sn, start, target, base, parts, cache, out):
+    def _auto_worker(self, model, sn, start, target, base, parts, cache, out, auto_dev=True):
         os.makedirs(cache, exist_ok=True)
         os.makedirs(out, exist_ok=True)
+
+        # 0) 预检：基础源镜像（增量链必须有源，否则白下载）
+        self.alog_write("[0] 检查基础源镜像 …")
+        if not base:
+            base = os.path.join(cache, "_base")
+            self.alog_write(f"    未指定基础源镜像目录，使用: {base}")
+        os.makedirs(base, exist_ok=True)
+        miss = missing_base_parts(parts, base)
+        if miss:
+            self.alog_write(f"    缺少 {len(miss)} 个分区的源镜像: {', '.join(miss)}")
+            if auto_dev:
+                conn, devver, slot = adb_device_state()
+                if not conn:
+                    self.alog_write("    [失败] adb 未连接设备，无法自动读取。请手动指定「基础源镜像目录」"
+                                    "（里面放起始版本的 <分区名>.img），或连接已 root 的设备后重试。")
+                    return
+                self.alog_write(f"    检测到设备：版本={devver}  槽位={slot}，尝试 dd 基础镜像 …")
+                got = adb_read_partitions(miss, base, self.alog_write)
+                miss = missing_base_parts(parts, base)
+                if devver and devver != start:
+                    self.alog_write(f"    [提示] 设备当前版本与所填起始版本不同：")
+                    self.alog_write(f"           填入: {start}")
+                    self.alog_write(f"           设备: {devver}")
+                    if got:
+                        self.alog_write(f"           → 改用设备版本作为链路起点")
+                        start = devver
+                if miss:
+                    self.alog_write(f"    [失败] 仍缺少: {', '.join(miss)}，停止（未开始下载）")
+                    return
+            else:
+                self.alog_write("    [失败] 未勾选自动读取且手动目录缺少这些分区，停止（未开始下载）")
+                return
+        self.alog_write(f"    源镜像就绪（{len(parts)} 个分区）")
+
         # 1) 走链
-        self.alog_write(f"[1] 查询链路：{start}".split("：")[0] + "：")
+        self.alog_write(f"[1] 查询链路，起点: {start}")
         hops, ver, seen = [], start, set()
         while True:
             try:
@@ -500,7 +597,17 @@ class App(tk.Tk):
                 ok = [p for p in parts if os.path.isfile(os.path.join(hop_out, p + ".img"))]
                 self.alog_write(f"      应用完成（{'增量包' if is_delta else '全量包'}），产出: {', '.join(ok) if ok else '无'}")
                 if not ok:
-                    self.alog_write("      [失败] 本跳没有产出，停止。常见原因：源镜像缺失/版本不匹配/分区含不支持的操作类型")
+                    err_lines = [l for l in log.splitlines()
+                                 if any(k in l for k in ("rror", "ailed", "unsupported",
+                                                         "not available", "mismatch", "Error"))]
+                    if err_lines:
+                        self.alog_write("      pdg 报错:")
+                        for l in err_lines[-6:]:
+                            self.alog_write("        " + l.strip())
+                    self.alog_write("      [失败] 本跳没有产出，已停止。排查顺序：")
+                    self.alog_write("        ① 源镜像是否为本跳 pre-build 版本的该分区（版本不匹配会失败）")
+                    self.alog_write("        ② 源镜像文件是否完整（大小应与分区一致）")
+                    self.alog_write("        ③ 该分区是否含不支持的操作类型（PUFFDIFF 等）")
                     return
                 cur = hop_out
             except Exception as e:
@@ -725,6 +832,12 @@ def cli():
     if a.cmd == "auto":
         os.makedirs(a.cache, exist_ok=True)
         os.makedirs(a.out, exist_ok=True)
+        parts_chk = [p for p in a.parts.split(",") if p]
+        miss = missing_base_parts(parts_chk, a.base)
+        if miss:
+            print(f"[预检失败] 基础源镜像缺少: {', '.join(miss)}")
+            print("          请用 --base 指向包含起始版本 <分区名>.img 的目录")
+            return
         hops, ver, seen = [], a.start, set()
         while True:
             r = query_next(a.model, a.sn, ver)

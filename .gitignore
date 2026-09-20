@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# 工具目录下的第三方二进制（由 build.bat 自动下载）
+tools/payload-dumper-go.exe
+tools/*.tar.gz
+
+# 运行时产物
+cache/
+auto_out/
+extracted/
+*.img
+*.zip
+*.bin
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

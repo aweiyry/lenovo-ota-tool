@@ -1,0 +1,5 @@
+# 运行本工具（源码模式）无需第三方依赖，仅使用 Python 标准库：
+#   urllib / tkinter / zipfile / subprocess / threading
+#
+# 以下依赖仅用于「打包成 EXE」：
+pyinstaller>=6.0

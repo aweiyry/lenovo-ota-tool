@@ -66,6 +66,10 @@ build.bat
 # 查询下一版本（--walk 自动走链）
 LenovoOtaTool.exe query --model <机型> --sn <SN> --version <当前版本串> [--walk]
 
+# 机型 / SN / 当前版本 三项都可以省略：
+# 省略时从已连接的平板自动读取（需要 adb），连上平板直接走整条链
+LenovoOtaTool.exe query --walk
+
 # 列出 OTA 包内的分区
 LenovoOtaTool.exe list --zip <ota.zip>
 
@@ -80,13 +84,37 @@ LenovoOtaTool.exe auto --model <机型> --sn <SN> \
     [--cache <缓存目录>] --out <输出目录>
 ```
 
-机型代号（`devicemodel`）：
+机型代号（`devicemodel`）分**稳定**与**内测(DF)**两套：
 
-| 机型 | devicemodel | 默认示例 SN |
+| 机型 | 稳定渠道 | 内测(DF)渠道 |
 |---|---|---|
-| 三代 TB321FU (Y700 2025) | `TB321FU_CN` | SN_请填你的序列号 |
-| 四代 TB322FC (Y700 2024) | `TB322FC_CN` | SN_请填你的序列号 |
-| 五代 TB323FU (Y700 Gen5) | `TB323FU_CN` | SN_请填你的序列号 |
+| 三代 TB321FU (Y700 2025) | `TB321FU_CN` | `TB321FU_CN_DF` |
+| 四代 TB322FC (Y700 2024) | `TB322FC_CN` | `TB322FC_CN_DF` |
+| 五代 TB323FU (Y700 Gen5) | `TB323FU_CN` | `TB323FU_CN_DF` |
+
+### 渠道代号必须交替使用（关键）
+
+版本串里带 `_DF_` 的是内测构建，服务器**只认带 `_DF` 后缀的机型代号**；
+稳定构建则只认不带后缀的代号。用错渠道，服务器返回空的 `<firmwareupdate/>`，
+表现就是「无下一版本」——很容易被误判成链路已经走完。
+
+```
+A16 稳定 2.0.12.199 ──[TB323FU_CN]─────▶ A17 内测 .053
+A17 内测 .053       ──[TB323FU_CN_DF]──▶ .107 ──▶ .131 ──▶ .165 ──▶ .198
+```
+
+工具会**按当前版本串自动切换**（见 `model_for_version()`），所以 `--walk`
+能从稳定版一路走到内测链尾，不会在第一个内测版本处断掉。
+
+平板自身的渠道身份可直接读到 —— 这也正是官方更新 App 决定 `devicemodel` 的来源：
+
+```bash
+adb shell getprop ro.product.ota.model     # 例：TB323FU_CN_DF
+adb shell getprop ro.build.version.incremental   # 当前版本串
+adb shell getprop ro.odm.lenovo.gsn        # 序列号 SN
+```
+
+图形界面「查询」页也有 **从设备读取机型/版本/SN** 按钮，一键填好这三项。
 
 ---
 
@@ -94,8 +122,13 @@ LenovoOtaTool.exe auto --model <机型> --sn <SN> \
 
 | 机型 | 链路 |
 |---|---|
-| 五代 TB323FU | `199 → 211(174.9MB) → 222(147.1MB) → 236(263.4MB)` |
+| 五代 TB323FU（稳定） | `199 → 211(174.9MB) → 222(147.1MB) → 236(263.4MB)` |
+| 五代 TB323FU（A17 内测） | `2.0.12.199 → A17 DF 2.5.02.053(8.0GB) → .107(1.3GB) → .131(4.1GB) → .165(0.8GB) → .198(2.8GB)` |
 | 四代 TB322FC | `1.1.11.120 → 1.5.10.229(9.8GB) → 1.5.10.259(181.8MB)` |
+
+> 内测链路需要**该机型内测白名单中的 SN**，且必须按上文交替使用
+> `TB323FU_CN` 与 `TB323FU_CN_DF`。上面的内测链路是一次 `--walk`
+> 跨渠道走完的结果。
 
 提取结果验证（与包内官方 manifest 期望哈希逐字节一致）：
 
@@ -125,7 +158,7 @@ POST https://ota.lenovo.com/ota-server/firmware/query/for-text-desc
 Content-Type: application/x-www-form-urlencoded
 
 action=querynewfirmware
-devicemodel=<机型>          # 如 TB323FU_CN
+devicemodel=<机型>          # 稳定渠道 TB323FU_CN / 内测渠道 TB323FU_CN_DF
 deviceid=<序列号 SN>
 curfirmwarever=<当前版本串>  # 必须精确，含日期后缀
 locale=zh
@@ -134,8 +167,12 @@ pid=
 ChecksumType=sha256
 ```
 
-返回 XML，含下一版本名称、增量包 CDN 直链（`otanew-cdn.lenovo.com` / `ota-cdn.lenovo.com`）、大小、MD5。
+返回 XML，含下一版本名称、增量包 CDN 直链（`otanew-cdn.lenovo.com` / `ota-cdn.lenovo.com`）、大小、校验值。
 服务器**逐级下发**：查询 N 返回 N→N+1 的增量包，因此沿链查询即可还原完整升级路径。
+
+> **关于校验值**：请求带 `ChecksumType=sha256`，但返回的标签名是 `<md5>`，
+> 其内容实际是 **64 位十六进制（SHA-256）**，并非 MD5。本工具按真实含义
+> 命名为 `sha256`（界面列头亦为 SHA256），与官方包内 manifest 的哈希一致。
 
 ### 为什么增量包需要"源镜像"
 
@@ -161,11 +198,17 @@ ChecksumType=sha256
 
 ```
 五代 TB323FU：TB323FU_CN_OPEN_USER_Q00020.0_A16_ZUXOS_2.0.12.<num>_ST_<YYMMDD>
+五代 TB323FU（A17 内测）：TB323FU_CN_OPEN_USER_Q00037.0_A17_DF_2.5.02.<num>_DEV_<YYMMDD>
 四代 TB322FC：TB322FC_CN_OPEN_USER_Q00041.1_V_ZUXOS_<x>.<x>.<num>_ST_<YYMMDD>
 三代 TB321FU：TB321FU_CN_OPEN_USER_Q00002.0_W_DF_17.5.10.<num>_ST_<YYMMDD>
 ```
 
+注意内测版本串中间带 `_DF_`、结尾常为 `_DEV_`，与大版本号一起构成内测标识
+（五代 A17 内测的 `Q00037.0` 也不同于稳定线的 `Q00020.0`）。
+
 获取设备当前版本：`adb shell getprop ro.build.version.incremental`
+（`ro.build.display.id` 同值，可互为兜底）
+获取设备渠道代号：`adb shell getprop ro.product.ota.model`
 从已有包获取精确版本串：`payload_properties.txt` 的 `pre-build` / `post-build` 字段。
 
 ---

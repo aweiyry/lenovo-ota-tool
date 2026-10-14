@@ -36,6 +36,10 @@ DEVICES = [
      "ver_hint": "TB322FC_CN_OPEN_USER_Q00041.1_V_ZUXOS_1.1.11.120_ST_250727"},
     {"name": "五代 TB323FU (Y700 Gen5)", "model": "TB323FU_CN", "sn": "SN_请填你的序列号",
      "ver_hint": "TB323FU_CN_OPEN_USER_Q00020.0_A16_ZUXOS_2.0.12.199_ST_260812"},
+    # 内测(DF)渠道：版本串含 _DF_ 时服务器只认带 _DF 后缀的机型代号，
+    # 走链过程中会自动切换（见 model_for_version）。此项用于直接从内测版本起步。
+    {"name": "五代 TB323FU (Y700 Gen5, 内测DF)", "model": "TB323FU_CN_DF", "sn": "SN_请填你的序列号",
+     "ver_hint": "TB323FU_CN_OPEN_USER_Q00037.0_A17_DF_2.5.02.165_DEV_260924"},
 ]
 
 if getattr(sys, "frozen", False):
@@ -48,6 +52,7 @@ else:
 PDG_CANDIDATES = [
     os.path.join(BUNDLE_DIR, "payload-dumper-go.exe"),
     os.path.join(BASE_DIR, "payload-dumper-go.exe"),
+    os.path.join(BASE_DIR, "tools", "payload-dumper-go.exe"),
     r"D:\DSH\ota\_ota\pdg2\payload-dumper-go.exe",
 ]
 
@@ -59,6 +64,72 @@ def find_pdg():
     return None
 
 
+# ---------------- 从已连接设备读取（adb，可选） ----------------
+
+def find_adb():
+    """定位 adb.exe：优先环境变量 ADB，其次 PATH。找不到返回 None。"""
+    env = os.environ.get("ADB")
+    if env and os.path.isfile(env):
+        return env
+    return shutil.which("adb") or shutil.which("adb.exe")
+
+
+def adb_getprop(prop, adb=None, timeout=10):
+    """读取设备系统属性；任何失败都返回 None，不抛异常。"""
+    adb = adb or find_adb()
+    if not adb:
+        return None
+    try:
+        r = subprocess.run([adb, "shell", "getprop", prop],
+                           capture_output=True, timeout=timeout)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    val = (r.stdout or b"").decode("utf-8", "replace").strip()
+    return val or None
+
+
+def detect_device():
+    """从已连接设备读取 OTA 三要素。
+
+    返回 {"model","version","sn"}；设备不可用或读不到版本串时返回 None。
+
+    devicemodel 取 ro.product.ota.model —— 这是官方更新 App 自己用的来源，
+    也是渠道身份的权威值（例：TB323FU_CN 为稳定渠道，TB323FU_CN_DF 为内测渠道）。
+    """
+    if not find_adb():
+        return None
+    version = (adb_getprop("ro.build.version.incremental")
+               or adb_getprop("ro.build.display.id"))
+    if not version:
+        return None
+    return {
+        "model": adb_getprop("ro.product.ota.model"),
+        "version": version,
+        "sn": adb_getprop("ro.odm.lenovo.gsn") or adb_getprop("ro.lenovosn2"),
+    }
+
+
+def resolve_target(model, sn, version):
+    """补齐缺失的 model/sn/version：能连设备就从设备读，否则报错退出。"""
+    if model and sn and version:
+        return model, sn, version
+    dev = detect_device()
+    if dev:
+        model = model or dev["model"]
+        sn = sn or dev["sn"]
+        version = version or dev["version"]
+    missing = [n for n, v in (("--model", model), ("--sn", sn),
+                              ("--version", version)) if not v]
+    if missing:
+        sys.exit("[错误] 缺少参数且无法从设备读取：%s\n"
+                 "       请补上这些参数，或连接平板并开启 USB 调试；\n"
+                 "       若 adb 不在 PATH，可设环境变量 ADB 指向 adb.exe。"
+                 % ", ".join(missing))
+    return model, sn, version
+
+
 def http_post_form(url, params, timeout=25):
     data = urllib.parse.urlencode(params).encode()
     req = urllib.request.Request(url, data=data,
@@ -66,6 +137,26 @@ def http_post_form(url, params, timeout=25):
                                           "User-Agent": "LenovoOtaTool/1.0"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8", "replace")
+
+
+DF_SUFFIX = "_DF"
+
+
+def model_for_version(base_model, version):
+    """按当前版本串自动切换 OTA 渠道，返回该跳应使用的机型代号。
+
+    实测（TB323FU，2026-10）：
+
+      - 稳定版本（版本串不含 ``_DF_``）→ 机型代号 ``TB323FU_CN``
+      - 内测版本（版本串含 ``_DF_``）  → 机型代号 ``TB323FU_CN_DF``
+
+    用错渠道，服务器返回空的 ``<firmwareupdate/>``（表现为"无下一版本"）。
+    A16 → A17 内测的入口必须用稳定渠道代号，进入内测链后必须换成 DF 代号，
+    两个代号交替使用才能走完整条链路，否则链会在第一个内测版本处断掉。
+    """
+    if not version or base_model.endswith(DF_SUFFIX):
+        return base_model
+    return base_model + DF_SUFFIX if "_DF_" in version else base_model
 
 
 def query_next(model, sn, cur_ver, timeout=25):
@@ -86,7 +177,9 @@ def query_next(model, sn, cur_ver, timeout=25):
         return None
     url = re.search(r"downloadurl.*?<!\[CDATA\[([^\]]+)\]\]", xml, re.S)
     size = re.search(r"<size>([^<]*)</size>", xml)
-    md5 = re.search(r"<md5>([^<]*)</md5>", xml)
+    # 注意：请求带 ChecksumType=sha256，服务器返回的 <md5> 标签里实际是
+    # 64 位十六进制（SHA-256），并非 MD5。此处按真实含义命名为 sha256。
+    digest = re.search(r"<md5>([^<]*)</md5>", xml)
     obj = re.search(r"<object_to_name>([^<]*)</object_to_name>", xml)
     to_ver = None
     if obj:
@@ -97,7 +190,7 @@ def query_next(model, sn, cur_ver, timeout=25):
         "name": name.group(1),
         "to_version": to_ver,
         "size": int(size.group(1)) if size and size.group(1).isdigit() else 0,
-        "md5": md5.group(1) if md5 else "",
+        "sha256": digest.group(1) if digest else "",
         "url": url.group(1) if url else "",
     }
 
@@ -421,6 +514,7 @@ class App(tk.Tk):
 
         btns = ttk.Frame(f)
         btns.pack(fill="x", padx=10, pady=4)
+        ttk.Button(btns, text="从设备读取机型/版本/SN", command=self.detect_from_device).pack(side="left", padx=4)
         ttk.Button(btns, text="查询下一版本", command=lambda: self.do_query(False)).pack(side="left", padx=4)
         ttk.Button(btns, text="自动走链（一直查到没有下一版）", command=lambda: self.do_query(True)).pack(side="left", padx=4)
         ttk.Button(btns, text="复制选中链接", command=self.copy_link).pack(side="left", padx=4)
@@ -428,10 +522,10 @@ class App(tk.Tk):
         ttk.Button(btns, text="下载选中包", command=self.download_selected).pack(side="left", padx=4)
         ttk.Button(btns, text="清空", command=lambda: self.tree.delete(*self.tree.get_children())).pack(side="left", padx=4)
 
-        cols = ("no", "to_ver", "size", "md5", "url")
+        cols = ("no", "to_ver", "size", "sha256", "url")
         self.tree = ttk.Treeview(f, columns=cols, show="headings", height=14)
         for c, t, w in (("no", "#", 40), ("to_ver", "目标版本", 330), ("size", "大小", 90),
-                        ("md5", "MD5", 200), ("url", "下载链接", 380)):
+                        ("sha256", "SHA256", 200), ("url", "下载链接", 380)):
             self.tree.heading(c, text=t)
             self.tree.column(c, width=w, anchor="w")
         self.tree.pack(fill="both", expand=True, padx=10, pady=4)
@@ -444,6 +538,37 @@ class App(tk.Tk):
         d = DEVICES[self.dev_combo.current()]
         self.sn_var.set(d["sn"])
         self.ver_var.set(d["ver_hint"])
+
+    def detect_from_device(self):
+        """从已连接平板读取机型代号 / 当前版本 / SN，并填进查询页。"""
+        dev = detect_device()
+        if not dev:
+            messagebox.showwarning(
+                "读取失败",
+                "未检测到可用设备。\n\n"
+                "请确认：\n"
+                "  1) 平板已用 USB 连接并开启「USB 调试」\n"
+                "  2) 电脑上可执行 adb（在 PATH 中）\n"
+                "  3) 若 adb 不在 PATH，可设环境变量 ADB 指向 adb.exe\n\n"
+                "也可手动填写机型、SN 与当前版本。")
+            return
+        if dev.get("sn"):
+            self.sn_var.set(dev["sn"])
+        if dev.get("version"):
+            self.ver_var.set(dev["version"])
+        model = dev.get("model")
+        if model:
+            models = [d["model"] for d in DEVICES]
+            if model in models:
+                self.dev_combo.current(models.index(model))
+            else:
+                DEVICES.append({"name": model + "（从设备读取）", "model": model,
+                                "sn": dev.get("sn") or "", "ver_hint": dev.get("version") or ""})
+                self.dev_combo["values"] = [d["name"] for d in DEVICES]
+                self.dev_combo.current(len(DEVICES) - 1)
+        self.qlog_write("[设备] model=%s\n       version=%s\n       sn=%s"
+                        % (dev.get("model"), dev.get("version"), dev.get("sn")))
+        self.qlog_write("[提示] 机型代号取自 ro.product.ota.model，即官方更新 App 自己用的渠道值")
 
     def qlog_write(self, s):
         self.qlog.insert("end", s + "\n")
@@ -463,9 +588,14 @@ class App(tk.Tk):
         self.qlog_write(f"[查询] model={model} sn={sn}\n        cur={ver}")
         idx = 0
         seen = set()
+        cur_model = model
         while True:
+            use_model = model_for_version(model, ver)
+            if use_model != cur_model:
+                self.qlog_write(f"[渠道] 检测到内测版本，机型代号切换为 {use_model}")
+                cur_model = use_model
             try:
-                r = query_next(model, sn, ver)
+                r = query_next(use_model, sn, ver)
             except Exception as e:
                 self.qlog_write(f"[错误] {e}")
                 break
@@ -475,7 +605,7 @@ class App(tk.Tk):
             idx += 1
             self.qlog_write(f"[命中] {idx}. {r['to_version']}  {human_size(r['size'])}")
             self.tree.insert("", "end", values=(idx, r["to_version"], human_size(r["size"]),
-                                                r["md5"], r["url"]))
+                                                r["sha256"], r["url"]))
             if not walk:
                 break
             nxt = r["to_version"]
@@ -492,7 +622,7 @@ class App(tk.Tk):
             messagebox.showinfo("提示", "请先在列表里选中一行")
             return None, None
         vals = self.tree.item(sel[0], "values")
-        # 列顺序: 0=#, 1=目标版本, 2=大小, 3=MD5, 4=下载链接
+        # 列顺序: 0=#, 1=目标版本, 2=大小, 3=SHA256, 4=下载链接
         return vals[4], vals[1]
 
     def _on_double_click(self, _evt=None):
@@ -697,9 +827,14 @@ class App(tk.Tk):
         # 1) 走链
         self.alog_write(f"[1] 查询链路，起点: {start}")
         hops, ver, seen = [], start, set()
+        cur_model = model
         while True:
+            use_model = model_for_version(model, ver)
+            if use_model != cur_model:
+                self.alog_write(f"[渠道] 检测到内测版本，机型代号切换为 {use_model}")
+                cur_model = use_model
             try:
-                r = query_next(model, sn, ver)
+                r = query_next(use_model, sn, ver)
             except Exception as e:
                 self.alog_write(f"[错误] 查询失败: {e}"); return
             if not r:
@@ -1020,9 +1155,11 @@ def cli():
     sub = ap.add_subparsers(dest="cmd")
 
     q = sub.add_parser("query")
-    q.add_argument("--model", required=True)
-    q.add_argument("--sn", required=True)
-    q.add_argument("--version", required=True)
+    q.add_argument("--model", default=None,
+                   help="机型代号；省略则从已连接设备读取 ro.product.ota.model")
+    q.add_argument("--sn", default=None, help="序列号；省略则从已连接设备读取")
+    q.add_argument("--version", default=None,
+                   help="当前版本串；省略则从已连接设备读取")
     q.add_argument("--walk", action="store_true")
 
     l = sub.add_parser("list")
@@ -1035,9 +1172,9 @@ def cli():
     e.add_argument("--old", default=None)
 
     au = sub.add_parser("auto")
-    au.add_argument("--model", required=True)
-    au.add_argument("--sn", required=True)
-    au.add_argument("--start", required=True)
+    au.add_argument("--model", default=None, help="机型代号；省略则从已连接设备读取")
+    au.add_argument("--sn", default=None, help="序列号；省略则从已连接设备读取")
+    au.add_argument("--start", default=None, help="起始版本串；省略则从已连接设备读取")
     au.add_argument("--target", default=None)
     au.add_argument("--base", default=None)
     au.add_argument("--parts", required=True)
@@ -1046,20 +1183,26 @@ def cli():
 
     a = ap.parse_args()
     if a.cmd == "query":
-        ver = a.version
+        a.model, a.sn, ver = resolve_target(a.model, a.sn, a.version)
         seen = set()
+        cur_model = a.model
         while True:
-            r = query_next(a.model, a.sn, ver)
+            use_model = model_for_version(a.model, ver)
+            if use_model != cur_model:
+                print(f"[渠道] 检测到内测版本，机型代号切换为 {use_model}")
+                cur_model = use_model
+            r = query_next(use_model, a.sn, ver)
             if not r:
                 print("(无下一版本)")
                 break
-            print(f"{r['to_version']}\t{human_size(r['size'])}\t{r['md5']}\t{r['url']}")
+            print(f"{r['to_version']}\t{human_size(r['size'])}\t{r['sha256']}\t{r['url']}")
             if not a.walk or not r["to_version"] or r["to_version"] in seen:
                 break
             seen.add(r["to_version"])
             ver = r["to_version"]
         return
     if a.cmd == "auto":
+        a.model, a.sn, a.start = resolve_target(a.model, a.sn, a.start)
         os.makedirs(a.cache, exist_ok=True)
         os.makedirs(a.out, exist_ok=True)
         parts_chk = [p for p in a.parts.split(",") if p]
@@ -1069,8 +1212,13 @@ def cli():
             print("          请用 --base 指向包含起始版本 <分区名>.img 的目录")
             return
         hops, ver, seen = [], a.start, set()
+        cur_model = a.model
         while True:
-            r = query_next(a.model, a.sn, ver)
+            use_model = model_for_version(a.model, ver)
+            if use_model != cur_model:
+                print(f"[渠道] 检测到内测版本，机型代号切换为 {use_model}")
+                cur_model = use_model
+            r = query_next(use_model, a.sn, ver)
             if not r:
                 print("(链路结束)")
                 break
